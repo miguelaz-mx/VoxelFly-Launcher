@@ -9,6 +9,9 @@ import customtkinter as ctk
 import minecraft_launcher_lib
 from PIL import Image
 
+from minecraft_manager import MinecraftManager, LaunchResult
+from mod_browser import ModBrowserFrame
+
 
 # ============================================================
 # RUTAS
@@ -113,6 +116,9 @@ class VoxelFlyApp(ctk.CTk):
 
         self.versions_loaded = False
         self.loading_versions = False
+        self.installing_game = False
+        self.install_progress_max = 0
+        self.minecraft_manager = MinecraftManager()
 
         # Imágenes.
         self.background_image: ctk.CTkImage | None = None
@@ -127,6 +133,7 @@ class VoxelFlyApp(ctk.CTk):
         self.profile_description: ctk.CTkLabel | None = None
         self.selected_summary: ctk.CTkLabel | None = None
         self.play_profile_button: ctk.CTkButton | None = None
+        self.banner_play_button: ctk.CTkButton | None = None
 
         self.memory_label: ctk.CTkLabel | None = None
         self.memory_slider: ctk.CTkSlider | None = None
@@ -522,6 +529,7 @@ class VoxelFlyApp(ctk.CTk):
         self.profile_description = None
         self.selected_summary = None
         self.play_profile_button = None
+        self.banner_play_button = None
         self.memory_label = None
         self.memory_slider = None
 
@@ -647,7 +655,7 @@ class VoxelFlyApp(ctk.CTk):
             padx=28,
         )
 
-        ctk.CTkButton(
+        self.banner_play_button = ctk.CTkButton(
             buttons,
             text="▶  JUGAR",
             width=155,
@@ -660,7 +668,9 @@ class VoxelFlyApp(ctk.CTk):
                 weight="bold",
             ),
             command=self.play,
-        ).pack(
+        )
+
+        self.banner_play_button.pack(
             side="left",
             padx=(0, 10),
         )
@@ -1310,10 +1320,7 @@ class VoxelFlyApp(ctk.CTk):
             return
 
         self.play_profile_button.configure(
-            text=(
-                f"JUGAR {loader_name.upper()} "
-                f"{version}"
-            ),
+            text=self.profile_play_button_text(),
             state="normal",
         )
 
@@ -1360,12 +1367,37 @@ class VoxelFlyApp(ctk.CTk):
         )
 
     def show_mods(self) -> None:
-        self.show_simple_screen(
-            title="Mods",
-            description=(
-                "Aquí aparecerá el navegador de mods, "
-                "sus dependencias y los mods instalados."
-            ),
+        if self.content is None:
+            return
+
+        self.clear_content()
+
+        self.content.grid_rowconfigure(
+            0,
+            weight=1,
+        )
+
+        self.content.grid_columnconfigure(
+            0,
+            weight=1,
+        )
+
+        mod_browser = ModBrowserFrame(
+            self.content,
+            loader_getter=self.selected_loader.get,
+            version_getter=self.selected_version.get,
+            status_callback=self.set_status,
+        )
+
+        mod_browser.grid(
+            row=0,
+            column=0,
+            columnspan=2,
+            sticky="nsew",
+        )
+
+        self.set_status(
+            "Navegador de mods abierto."
         )
 
     def show_settings(self) -> None:
@@ -1439,17 +1471,15 @@ class VoxelFlyApp(ctk.CTk):
     # ========================================================
 
     def play(self) -> None:
-        loader_name = (
-            self.selected_loader.get()
-        )
+        if self.installing_game:
+            self.set_status(
+                "Ya hay una instalación en proceso."
+            )
+            return
 
-        version = (
-            self.selected_version.get()
-        )
-
-        memory_mb = (
-            self.memory_value.get()
-        )
+        loader_name = self.selected_loader.get()
+        version = self.selected_version.get()
+        memory_mb = self.memory_value.get()
 
         if version in {
             "Cargando...",
@@ -1460,21 +1490,163 @@ class VoxelFlyApp(ctk.CTk):
             )
             return
 
+        self.installing_game = True
+        self.install_progress_max = 0
+        self.set_play_buttons_enabled(False)
+
         self.set_status(
             f"Preparando {loader_name} "
             f"{version} con "
             f"{memory_mb / 1024:.1f} GB..."
         )
 
-        print("==============================")
-        print("Perfil seleccionado")
-        print("==============================")
-        print(f"Cargador: {loader_name}")
-        print(f"Versión: {version}")
-        print(f"Memoria RAM: {memory_mb} MB")
-        print(
-            "Después conectaremos este botón "
-            "con el instalador."
+        threading.Thread(
+            target=self.install_and_launch_worker,
+            args=(loader_name, version, memory_mb),
+            daemon=True,
+        ).start()
+
+    def set_play_buttons_enabled(
+        self,
+        enabled: bool,
+    ) -> None:
+        state = "normal" if enabled else "disabled"
+
+        if self.banner_play_button is not None:
+            self.banner_play_button.configure(
+                state=state,
+                text=(
+                    "▶  JUGAR"
+                    if enabled
+                    else "INSTALANDO..."
+                ),
+            )
+
+        if self.play_profile_button is not None:
+            self.play_profile_button.configure(
+                state=state,
+                text=(
+                    self.profile_play_button_text()
+                    if enabled
+                    else "INSTALANDO..."
+                ),
+            )
+
+    def profile_play_button_text(self) -> str:
+        return (
+            f"JUGAR {self.selected_loader.get().upper()} "
+            f"{self.selected_version.get()}"
+        )
+
+    def install_and_launch_worker(
+        self,
+        loader_name: str,
+        version: str,
+        memory_mb: int,
+    ) -> None:
+        callback = {
+            "setStatus": self.install_status_callback,
+            "setProgress": self.install_progress_callback,
+            "setMax": self.install_max_callback,
+        }
+
+        try:
+            result = self.minecraft_manager.install_and_launch(
+                loader_name=loader_name,
+                minecraft_version=version,
+                memory_mb=memory_mb,
+                callback=callback,
+            )
+        except Exception as error:
+            error_text = str(error)
+            self.after(
+                0,
+                lambda: self.finish_installation_error(
+                    error_text
+                ),
+            )
+            return
+
+        self.after(
+            0,
+            lambda: self.finish_installation_success(
+                result
+            ),
+        )
+
+    def install_status_callback(
+        self,
+        status: str,
+    ) -> None:
+        self.after(
+            0,
+            lambda: self.set_status(
+                str(status)
+            ),
+        )
+
+    def install_max_callback(
+        self,
+        maximum: int,
+    ) -> None:
+        self.install_progress_max = max(
+            int(maximum),
+            0,
+        )
+
+    def install_progress_callback(
+        self,
+        progress: int,
+    ) -> None:
+        current = int(progress)
+        maximum = self.install_progress_max
+
+        if maximum > 0:
+            percentage = min(
+                100,
+                int(current / maximum * 100),
+            )
+            message = (
+                f"Descargando archivos: "
+                f"{percentage}% "
+                f"({current}/{maximum})"
+            )
+        else:
+            message = (
+                f"Descargando archivos: {current}"
+            )
+
+        self.after(
+            0,
+            lambda: self.set_status(message),
+        )
+
+    def finish_installation_success(
+        self,
+        result: LaunchResult,
+    ) -> None:
+        self.installing_game = False
+        self.set_play_buttons_enabled(True)
+
+        if result.launched:
+            self.set_status(result.message)
+            return
+
+        self.set_status(
+            f"Instalado: {result.installed_version}. "
+            f"{result.message}"
+        )
+
+    def finish_installation_error(
+        self,
+        error_text: str,
+    ) -> None:
+        self.installing_game = False
+        self.set_play_buttons_enabled(True)
+
+        self.set_status(
+            f"Error al instalar o iniciar: "
+            f"{error_text}"
         )
 
     def open_account(self) -> None:

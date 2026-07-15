@@ -1,3 +1,4 @@
-customtkinter
+customtkinter>=6.0.0
 pillow
 minecraft-launcher-lib
+requests
